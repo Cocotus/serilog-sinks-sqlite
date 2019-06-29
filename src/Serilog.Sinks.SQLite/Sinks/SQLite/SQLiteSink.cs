@@ -15,7 +15,6 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Data.SQLite;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -25,6 +24,7 @@ using Serilog.Debugging;
 using Serilog.Events;
 using Serilog.Sinks.Batch;
 using Serilog.Sinks.Extensions;
+using SQLite;
 
 namespace Serilog.Sinks.SQLite
 {
@@ -64,11 +64,12 @@ namespace Serilog.Sinks.SQLite
 
             if (maxDatabaseSize > MaxSupportedDatabaseSize)
             {
-                throw new SQLiteException($"Database size greater than {MaxSupportedDatabaseSize} MB is not supported");
+                SelfLog.WriteLine($"Database size greater than {MaxSupportedDatabaseSize} MB is not supported");
+                throw new ArgumentException($"Database size greater than {MaxSupportedDatabaseSize} MB is not supported");
             }
 
             InitializeDatabase();
-
+           
             if (retentionPeriod.HasValue)
             {
                 // impose a min retention period of 15 minute
@@ -101,100 +102,39 @@ namespace Serilog.Sinks.SQLite
 
         #endregion
 
-        private void InitializeDatabase()
+        private async void InitializeDatabase()
         {
-            using (var conn = GetSqLiteConnection())
-            {
-                CreateSqlTable(conn);
-            }
+            SQLiteAsyncConnection conn = GetSqLiteConnection();
+            await CreateSqlTable(conn);
+            await conn.CloseAsync();
         }
 
-        private SQLiteConnection GetSqLiteConnection()
+        private SQLiteAsyncConnection GetSqLiteConnection()
         {
-            var sqlConString = new SQLiteConnectionStringBuilder
-            {
-                DataSource = _databasePath,
-                JournalMode = SQLiteJournalModeEnum.Memory,
-                SyncMode = SynchronizationModes.Normal,
-                CacheSize = 500,
-                PageSize = (int)MaxSupportedPageSize,
-                MaxPageCount = (int)(_maxDatabaseSize * BytesPerMb / MaxSupportedPageSize)
-            }.ConnectionString;
-
-            var sqLiteConnection = new SQLiteConnection(sqlConString);
-            sqLiteConnection.Open();
-
-            return sqLiteConnection;
+            var sqlConnection = new SQLiteAsyncConnection(_databasePath);
+            return sqlConnection;
         }
 
-        private void CreateSqlTable(SQLiteConnection sqlConnection)
+        private async Task CreateSqlTable(SQLiteAsyncConnection sqlConnection)
         {
-            var colDefs = "id INTEGER PRIMARY KEY AUTOINCREMENT,";
-            colDefs += "Timestamp TEXT,";
-            colDefs += "Level VARCHAR(10),";
-            colDefs += "Exception TEXT,";
-            colDefs += "RenderedMessage TEXT,";
-            colDefs += "Properties TEXT";
-
-            var sqlCreateText = $"CREATE TABLE IF NOT EXISTS {_tableName} ({colDefs})";
-
-            var sqlCommand = new SQLiteCommand(sqlCreateText, sqlConnection);
-            sqlCommand.ExecuteNonQuery();
+            await sqlConnection.CreateTableAsync<LogEntry>();
         }
 
-        private SQLiteCommand CreateSqlInsertCommand(SQLiteConnection connection)
-        {
-            var sqlInsertText = "INSERT INTO {0} (Timestamp, Level, Exception, RenderedMessage, Properties)";
-            sqlInsertText += " VALUES (@timeStamp, @level, @exception, @renderedMessage, @properties)";
-            sqlInsertText = string.Format(sqlInsertText, _tableName);
-
-            var sqlCommand = connection.CreateCommand();
-            sqlCommand.CommandText = sqlInsertText;
-            sqlCommand.CommandType = CommandType.Text;
-
-            sqlCommand.Parameters.Add(new SQLiteParameter("@timeStamp", DbType.DateTime2));
-            sqlCommand.Parameters.Add(new SQLiteParameter("@level", DbType.String));
-            sqlCommand.Parameters.Add(new SQLiteParameter("@exception", DbType.String));
-            sqlCommand.Parameters.Add(new SQLiteParameter("@renderedMessage", DbType.String));
-            sqlCommand.Parameters.Add(new SQLiteParameter("@properties", DbType.String));
-
-            return sqlCommand;
-        }
-
-        private void ApplyRetentionPolicy()
+        private async void ApplyRetentionPolicy()
         {
             var epoch = DateTimeOffset.Now.Subtract(_retentionPeriod.Value);
-            using (var sqlConnection = GetSqLiteConnection())
-            {
-                using (var cmd = CreateSqlDeleteCommand(sqlConnection, epoch))
-                {
-                    SelfLog.WriteLine("Deleting log entries older than {0}", epoch);
-                    var ret = cmd.ExecuteNonQuery();
-                    SelfLog.WriteLine($"{ret} records deleted");
-                }
-            }
+            var sqlConnection = GetSqLiteConnection();
+            var query = sqlConnection.Table<LogEntry>().Where(s => s.Timestamp < (_storeTimestampInUtc ? epoch.ToUniversalTime() : epoch));
+            SelfLog.WriteLine("Deleting log entries older than {0}", epoch);
+            await query.DeleteAsync();
+            await sqlConnection.CloseAsync();
         }
 
-        private void TruncateLog(SQLiteConnection sqlConnection)
+        private async Task<int> TruncateLog(SQLiteAsyncConnection sqlConnection)
         {
-            var cmd = sqlConnection.CreateCommand();
-            cmd.CommandText = $"DELETE FROM {_tableName}";
-            cmd.ExecuteNonQuery();
+          return await sqlConnection.DeleteAllAsync<LogEntry>();
         }
 
-        private SQLiteCommand CreateSqlDeleteCommand(SQLiteConnection sqlConnection, DateTimeOffset epoch)
-        {
-            var cmd = sqlConnection.CreateCommand();
-            cmd.CommandText = $"DELETE FROM {_tableName} WHERE Timestamp < @epoch";
-            cmd.Parameters.Add(
-                new SQLiteParameter("@epoch", DbType.DateTime2)
-                {
-                    Value = (_storeTimestampInUtc ? epoch.ToUniversalTime() : epoch).ToString(
-                        "yyyy-MM-ddTHH:mm:ss")
-                });
-
-            return cmd;
-        }
 
         protected override async Task<bool> WriteLogEventAsync(ICollection<LogEvent> logEventsBatch)
         {
@@ -203,8 +143,7 @@ namespace Serilog.Sinks.SQLite
             await semaphoreSlim.WaitAsync().ConfigureAwait(false);
             try
             {
-                using (var sqlConnection = GetSqLiteConnection())
-                {
+                    var sqlConnection = GetSqLiteConnection();
                     try
                     {
                         await WriteToDatabaseAsync(logEventsBatch, sqlConnection).ConfigureAwait(false);
@@ -214,7 +153,7 @@ namespace Serilog.Sinks.SQLite
                     {
                         SelfLog.WriteLine(e.Message);
 
-                        if (e.ResultCode != SQLiteErrorCode.Full)
+                        if (e.Result != SQLite3.Result.Full)
                             return false;
 
                         if (_rollOver == false)
@@ -231,7 +170,7 @@ namespace Serilog.Sinks.SQLite
                          
                         File.Copy(_databasePath, newFilePath, true);
 
-                        TruncateLog(sqlConnection);
+                        await TruncateLog(sqlConnection);
                         await WriteToDatabaseAsync(logEventsBatch, sqlConnection).ConfigureAwait(false);
 
                         SelfLog.WriteLine($"Rolling database to {newFilePath}");
@@ -242,6 +181,9 @@ namespace Serilog.Sinks.SQLite
                         SelfLog.WriteLine(e.Message);
                         return false;
                     }
+                finally
+                {
+                    await sqlConnection.CloseAsync();
                 }
             }
             finally
@@ -250,33 +192,20 @@ namespace Serilog.Sinks.SQLite
             }
         }
 
-        private async Task WriteToDatabaseAsync(ICollection<LogEvent> logEventsBatch, SQLiteConnection sqlConnection)
+        private async Task WriteToDatabaseAsync(ICollection<LogEvent> logEventsBatch, SQLiteAsyncConnection sqlConnection)
         {
-            using (var tr = sqlConnection.BeginTransaction())
+            List<LogEntry> loglist = new List<LogEntry>();
+            foreach (var logEvent in logEventsBatch)
             {
-                using (var sqlCommand = CreateSqlInsertCommand(sqlConnection))
-                {
-                    sqlCommand.Transaction = tr;
-
-                    foreach (var logEvent in logEventsBatch)
-                    {
-                        sqlCommand.Parameters["@timeStamp"].Value = _storeTimestampInUtc
-                            ? logEvent.Timestamp.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss")
-                            : logEvent.Timestamp.ToString("yyyy-MM-ddTHH:mm:ss");
-                        sqlCommand.Parameters["@level"].Value = logEvent.Level.ToString();
-                        sqlCommand.Parameters["@exception"].Value =
-                            logEvent.Exception?.ToString() ?? string.Empty;
-                        sqlCommand.Parameters["@renderedMessage"].Value = logEvent.MessageTemplate.Text;
-
-                        sqlCommand.Parameters["@properties"].Value = logEvent.Properties.Count > 0
-                            ? logEvent.Properties.Json()
-                            : string.Empty;
-
-                        await sqlCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
-                    }
-                    tr.Commit();
-                }
+                LogEntry newLogentry = new LogEntry();
+                newLogentry.Timestamp = _storeTimestampInUtc ? logEvent.Timestamp.UtcDateTime: logEvent.Timestamp.LocalDateTime;
+                newLogentry.Exception = logEvent.Exception?.ToString() ?? string.Empty;
+                newLogentry.Level = logEvent.Level;
+                newLogentry.RenderedMessage = logEvent.MessageTemplate.Text;
+                newLogentry.Properties = logEvent.Properties.Count > 0 ? logEvent.Properties.Json() : string.Empty;
+                loglist.Add(newLogentry);
             }
+          await sqlConnection.InsertAllAsync(loglist);
         }
     }
 }
